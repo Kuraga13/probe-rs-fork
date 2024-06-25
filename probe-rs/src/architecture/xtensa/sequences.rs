@@ -3,6 +3,7 @@ use std::{fmt::Debug, sync::Arc, time::Duration};
 use crate::architecture::xtensa::communication_interface::{
     ProgramStatus, XtensaCommunicationInterface, XtensaError,
 };
+use crate::Session;
 
 /// A interface to operate debug sequences for Xtensa targets.
 ///
@@ -17,10 +18,7 @@ pub trait XtensaDebugSequence: Send + Sync + Debug {
     }
 
     /// Detects the flash size of the target.
-    fn detect_flash_size(
-        &self,
-        _interface: &mut XtensaCommunicationInterface,
-    ) -> Result<Option<usize>, crate::Error> {
+    fn detect_flash_size(&self, _session: &mut Session) -> Result<Option<usize>, crate::Error> {
         Ok(None)
     }
 
@@ -36,7 +34,7 @@ pub trait XtensaDebugSequence: Send + Sync + Debug {
         // Make sure the CPU is in a known state and is able to run code we download.
         interface.write_register({
             let mut ps = ProgramStatus(0);
-            ps.set_intlevel(1);
+            ps.set_intlevel(0);
             ps.set_user_mode(true);
             ps.set_woe(true);
             ps

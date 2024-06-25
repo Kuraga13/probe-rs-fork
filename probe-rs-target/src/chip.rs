@@ -1,5 +1,10 @@
+use std::collections::HashMap;
+
 use super::memory::MemoryRegion;
-use crate::{serialize::hex_option, CoreType};
+use crate::{
+    serialize::{hex_option, hex_u_int},
+    CoreType,
+};
 use serde::{Deserialize, Serialize};
 
 /// Represents a DAP scan chain element.
@@ -47,6 +52,9 @@ pub struct Chip {
     pub part: Option<u16>,
     /// An URL to the SVD file for this chip.
     pub svd: Option<String>,
+    /// Documentation URLs associated with this chip.
+    #[serde(default)]
+    pub documentation: HashMap<String, url::Url>,
     /// The cores available on the chip.
     #[serde(default)]
     pub cores: Vec<Core>,
@@ -92,6 +100,7 @@ impl Chip {
             name: name.to_string(),
             part: None,
             svd: None,
+            documentation: HashMap::new(),
             cores: vec![Core {
                 name: "main".to_string(),
                 core_type,
@@ -138,6 +147,7 @@ pub struct ArmCoreAccessOptions {
     /// The access port number to access the core
     pub ap: u8,
     /// The port select number to access the core
+    #[serde(serialize_with = "hex_u_int")]
     pub psel: u32,
     /// The base address of the debug registers for the core.
     /// Required for Cortex-A, optional for Cortex-M

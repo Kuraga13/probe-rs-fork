@@ -10,14 +10,41 @@ pub struct NvmRegion {
     /// Address range of the region
     #[serde(serialize_with = "hex_range")]
     pub range: Range<u64>,
-    /// True if the chip boots from this memory
-    #[serde(default)]
-    pub is_boot_memory: bool,
     /// List of cores that can access this region
     pub cores: Vec<String>,
     /// True if the memory region is an alias of a different memory region.
     #[serde(default)]
     pub is_alias: bool,
+    /// Access permissions for the region.
+    #[serde(default)]
+    pub access: Option<MemoryAccess>,
+}
+
+impl NvmRegion {
+    /// Returns the access permissions for the region.
+    pub fn access(&self) -> MemoryAccess {
+        self.access.unwrap_or_default()
+    }
+
+    /// Returns whether the region is readable.
+    pub fn is_readable(&self) -> bool {
+        self.access().read
+    }
+
+    /// Returns whether the region is writable.
+    pub fn is_writable(&self) -> bool {
+        self.access().write
+    }
+
+    /// Returns whether the region is executable.
+    pub fn is_executable(&self) -> bool {
+        self.access().execute
+    }
+
+    /// Returns whether the region is boot memory.
+    pub fn is_boot_memory(&self) -> bool {
+        self.access().boot
+    }
 }
 
 impl NvmRegion {
@@ -25,6 +52,38 @@ impl NvmRegion {
     pub fn nvm_info(&self) -> NvmInfo {
         NvmInfo {
             rom_start: self.range.start,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Represents access permissions of a region in RAM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MemoryAccess {
+    /// True if the region is readable.
+    #[serde(default = "default_true")]
+    pub read: bool,
+    /// True if the region is writable.
+    #[serde(default = "default_true")]
+    pub write: bool,
+    /// True if the region is executable.
+    #[serde(default = "default_true")]
+    pub execute: bool,
+    /// True if the chip boots from this memory
+    #[serde(default)]
+    pub boot: bool,
+}
+
+impl Default for MemoryAccess {
+    fn default() -> Self {
+        MemoryAccess {
+            read: true,
+            write: true,
+            execute: true,
+            boot: false,
         }
     }
 }
@@ -37,11 +96,38 @@ pub struct RamRegion {
     /// Address range of the region
     #[serde(serialize_with = "hex_range")]
     pub range: Range<u64>,
-    /// True if the chip boots from this memory
-    #[serde(default)]
-    pub is_boot_memory: bool,
     /// List of cores that can access this region
     pub cores: Vec<String>,
+    /// Access permissions for the region.
+    #[serde(default)]
+    pub access: Option<MemoryAccess>,
+}
+
+impl RamRegion {
+    /// Returns the access permissions for the region.
+    pub fn access(&self) -> MemoryAccess {
+        self.access.unwrap_or_default()
+    }
+
+    /// Returns whether the region is readable.
+    pub fn is_readable(&self) -> bool {
+        self.access().read
+    }
+
+    /// Returns whether the region is writable.
+    pub fn is_writable(&self) -> bool {
+        self.access().write
+    }
+
+    /// Returns whether the region is executable.
+    pub fn is_executable(&self) -> bool {
+        self.access().execute
+    }
+
+    /// Returns whether the region is boot memory.
+    pub fn is_boot_memory(&self) -> bool {
+        self.access().boot
+    }
 }
 
 /// Represents a generic region.
@@ -54,6 +140,31 @@ pub struct GenericRegion {
     pub range: Range<u64>,
     /// List of cores that can access this region
     pub cores: Vec<String>,
+    /// Access permissions for the region.
+    #[serde(default)]
+    pub access: Option<MemoryAccess>,
+}
+
+impl GenericRegion {
+    /// Returns the access permissions for the region.
+    pub fn access(&self) -> MemoryAccess {
+        self.access.unwrap_or_default()
+    }
+
+    /// Returns whether the region is readable.
+    pub fn is_readable(&self) -> bool {
+        self.access().read
+    }
+
+    /// Returns whether the region is writable.
+    pub fn is_writable(&self) -> bool {
+        self.access().write
+    }
+
+    /// Returns whether the region is executable.
+    pub fn is_executable(&self) -> bool {
+        self.access().execute
+    }
 }
 
 /// Holds information about a specific, individual flash
@@ -64,6 +175,13 @@ pub struct SectorInfo {
     pub base_address: u64,
     /// Size of the flash sector
     pub size: u64,
+}
+
+impl SectorInfo {
+    /// Returns the address range of the sector.
+    pub fn address_range(&self) -> Range<u64> {
+        self.base_address..self.base_address + self.size
+    }
 }
 
 /// Information about a group of flash sectors, which
@@ -94,6 +212,13 @@ pub struct PageInfo {
     pub base_address: u64,
     /// Size of the page
     pub size: u32,
+}
+
+impl PageInfo {
+    /// Returns the address range of the sector.
+    pub fn address_range(&self) -> Range<u64> {
+        self.base_address..self.base_address + self.size as u64
+    }
 }
 
 /// Holds information about the entire flash.
@@ -199,6 +324,22 @@ impl MemoryRegion {
             MemoryRegion::Generic(region) => &region.cores,
             MemoryRegion::Nvm(region) => &region.cores,
         }
+    }
+
+    /// Returns `true` if the memory region is [`Ram`].
+    ///
+    /// [`Ram`]: MemoryRegion::Ram
+    #[must_use]
+    pub fn is_ram(&self) -> bool {
+        matches!(self, Self::Ram(..))
+    }
+
+    /// Returns `true` if the memory region is [`Nvm`].
+    ///
+    /// [`Nvm`]: MemoryRegion::Nvm
+    #[must_use]
+    pub fn is_nvm(&self) -> bool {
+        matches!(self, Self::Nvm(..))
     }
 }
 

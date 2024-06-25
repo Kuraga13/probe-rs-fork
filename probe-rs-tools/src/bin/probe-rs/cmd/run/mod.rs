@@ -6,7 +6,7 @@ use test_run_mode::*;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -60,7 +60,7 @@ pub struct SharedOptions {
     If the binary uses `embedded-test` each test will be executed in turn. See `TEST OPTIONS` for more configuration options exclusive to this mode.\n\
     If the binary does not use `embedded-test` the binary will be flashed and run normally. See `RUN OPTIONS` for more configuration options exclusive to this mode."
     )]
-    pub(crate) path: String,
+    pub(crate) path: PathBuf,
 
     /// Always print the stacktrace on ctrl + c.
     #[clap(long)]
@@ -151,7 +151,7 @@ trait RunMode {
 
 fn detect_run_mode(cmd: &Cmd) -> Result<Box<dyn RunMode>, anyhow::Error> {
     let elf_contains_test = {
-        let mut file = match File::open(cmd.shared_options.path.as_str()) {
+        let mut file = match File::open(&cmd.shared_options.path) {
             Ok(file) => file,
             Err(e) => return Err(FileDownloadError::IO(e)).context("Failed to open binary file."),
         };
@@ -194,7 +194,7 @@ struct RunLoop {
     core_id: usize,
     memory_map: Vec<MemoryRegion>,
     rtt_scan_regions: Vec<Range<u64>>,
-    path: String,
+    path: PathBuf,
     timestamp_offset: UtcOffset,
     always_print_stacktrace: bool,
     no_location: bool,
@@ -262,13 +262,11 @@ impl RunLoop {
         }
         let start = Instant::now();
 
-        let mut rtt_config = rtt::RttConfig {
-            log_format: self.log_format.clone(),
-            ..Default::default()
-        };
+        let mut rtt_config = rtt::RttConfig::default();
         rtt_config.channels.push(rtt::RttChannelConfig {
             channel_number: Some(0),
             show_location: !self.no_location,
+            log_format: self.log_format.clone(),
             ..Default::default()
         });
 
@@ -283,6 +281,42 @@ impl RunLoop {
         )
         .context("Failed to attach to RTT")?;
 
+        let result = self.do_run_until(
+            core,
+            &mut rtta,
+            output_stream,
+            timeout,
+            start,
+            &mut predicate,
+        );
+
+        // Always clean up after RTT but don't overwrite the original result.
+        let cleanup_result = if let Some(mut rtta) = rtta {
+            rtta.clean_up(core)
+        } else {
+            Ok(())
+        };
+
+        if result.is_ok() {
+            // If the result is Ok, we return the potential error during cleanup.
+            cleanup_result?;
+        }
+
+        result
+    }
+
+    fn do_run_until<F, R>(
+        &self,
+        core: &mut Core,
+        rtta: &mut Option<rtt::RttActiveTarget>,
+        output_stream: OutputStream,
+        timeout: Option<Duration>,
+        start: Instant,
+        predicate: &mut F,
+    ) -> Result<ReturnReason<R>>
+    where
+        F: FnMut(HaltReason, &mut Core) -> Result<Option<R>>,
+    {
         let exit = Arc::new(AtomicBool::new(false));
         let sig_id = signal_hook::flag::register(signal::SIGINT, exit.clone())?;
 
@@ -321,7 +355,7 @@ impl RunLoop {
                 }
             }
 
-            let had_rtt_data = poll_rtt(&mut rtta, core, output_stream)?;
+            let had_rtt_data = poll_rtt(rtta, core, output_stream)?;
 
             if return_reason.is_none() {
                 if exit.load(Ordering::Relaxed) {
@@ -489,7 +523,7 @@ fn attach_to_rtt(
     // fall back to the caller-provided scan regions.
     let elf = fs::read(elf_file)?;
     let scan_region = if let Some(address) = RttActiveTarget::get_rtt_symbol_from_bytes(&elf) {
-        ScanRegion::Exact(address as u32)
+        ScanRegion::Exact(address)
     } else {
         rtt_region.clone()
     };

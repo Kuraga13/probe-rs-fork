@@ -6,7 +6,7 @@ use crate::architecture::riscv::communication_interface::{RiscvDebugInterfaceSta
 use crate::architecture::xtensa::communication_interface::{
     XtensaCommunicationInterface, XtensaDebugInterfaceState, XtensaError,
 };
-use crate::config::{ChipInfo, CoreExt, RegistryError, Target, TargetSelector};
+use crate::config::{CoreExt, RegistryError, Target, TargetSelector};
 use crate::core::{Architecture, CombinedCoreState};
 use crate::probe::fake_probe::FakeProbe;
 use crate::probe::ProbeCreationError;
@@ -190,8 +190,7 @@ impl Session {
         };
 
         if AttachMethod::UnderReset == attach_method {
-            let span = tracing::debug_span!("Asserting hardware assert");
-            let _enter = span.enter();
+            let _span = tracing::debug_span!("Asserting hardware reset").entered();
 
             if let Some(dap_probe) = probe.try_as_dap_probe() {
                 sequence_handle.reset_hardware_assert(dap_probe)?;
@@ -446,8 +445,9 @@ impl Session {
         let mut resume_state = vec![];
         for (core, _) in self.list_cores() {
             let mut c = self.core(core)?;
-            tracing::info!("Core status: {:?}", c.status()?);
-            if !c.core_halted()? {
+            let status = c.status()?;
+            tracing::info!("Core status: {:?}", status);
+            if !status.is_halted() {
                 tracing::info!("Halting core...");
                 resume_state.push(core);
                 c.halt(Duration::from_millis(100))?;
@@ -486,7 +486,8 @@ impl Session {
     ///
     /// The idea behind this is: You need the smallest common denominator which you can share between threads. Since you sometimes need the [Core], sometimes the [Probe] or sometimes the [Target], the [Session] is the only common ground and the only handle you should actively store in your code.
     ///
-    #[tracing::instrument(skip(self), name = "attach_to_core")]
+    // By design, this is called frequently in a session, therefore we limit tracing level to "trace" to avoid spamming the logs.
+    #[tracing::instrument(level = "trace", skip(self), name = "attach_to_core")]
     pub fn core(&mut self, core_index: usize) -> Result<Core<'_>, Error> {
         let combined_state = self
             .cores
@@ -777,7 +778,11 @@ impl Session {
 }
 
 // This test ensures that [Session] is fully [Send] + [Sync].
-static_assertions::assert_impl_all!(Session: Send);
+const _: fn() = || {
+    fn assert_impl_all<T: ?Sized + Send>() {}
+
+    assert_impl_all::<Session>();
+};
 
 // TODO tiwalun: Enable again, after rework of Session::new is done.
 impl Drop for Session {
@@ -810,20 +815,12 @@ impl Drop for Session {
 fn get_target_from_selector(
     target: TargetSelector,
     attach_method: AttachMethod,
-    probe: Probe,
+    mut probe: Probe,
 ) -> Result<(Probe, Target), Error> {
-    let mut probe = probe;
-
     let target = match target {
         TargetSelector::Unspecified(name) => crate::config::get_target_by_name(name)?,
         TargetSelector::Specified(target) => target,
         TargetSelector::Auto => {
-            let mut found_chip = None;
-
-            // We have no information about the target, so we must assume it's using the default DP.
-            // We cannot automatically detect DPs if SWD multi-drop is used.
-            let dp_address = DpAddress::Default;
-
             // At this point we do not know what the target is, so we cannot use the chip specific reset sequence.
             // Thus, we try just using a normal reset for target detection if we want to do so under reset.
             // This can of course fail, but target detection is a best effort, not a guarantee!
@@ -832,58 +829,14 @@ fn get_target_from_selector(
             }
             probe.attach_to_unspecified()?;
 
-            if probe.has_arm_interface() {
-                match probe.try_into_arm_interface() {
-                    Ok(interface) => {
-                        let mut interface = interface
-                            .initialize(DefaultArmSequence::create(), dp_address)
-                            .map_err(|(_probe, err)| err)?;
-
-                        // TODO:
-                        let dp = DpAddress::Default;
-
-                        let found_arm_chip = interface
-                            .read_chip_info_from_rom_table(dp)
-                            .unwrap_or_else(|e| {
-                                tracing::info!("Error during auto-detection of ARM chips: {}", e);
-                                None
-                            });
-
-                        found_chip = found_arm_chip.map(ChipInfo::from);
-
-                        probe = interface.close();
-                    }
-                    Err((returned_probe, err)) => {
-                        probe = returned_probe;
-                        tracing::debug!("Error using ARM interface: {}", err);
-                    }
-                }
-            } else {
-                tracing::debug!("No ARM interface was present. Skipping Riscv autodetect.");
-            }
-
-            if found_chip.is_none() && probe.has_riscv_interface() {
-                match probe.try_get_riscv_interface_builder() {
-                    Ok(factory) => {
-                        let mut state = factory.create_state();
-                        let mut interface = factory.attach(&mut state)?;
-                        let idcode = interface.read_idcode();
-
-                        tracing::debug!("ID Code read over JTAG: {:x?}", idcode);
-                    }
-                    Err(err) => {
-                        tracing::debug!("Error during autodetection of RISC-V chips: {}", err);
-                    }
-                }
-            } else {
-                tracing::debug!("No RISC-V interface was present. Skipping Riscv autodetect.");
-            }
+            let (returned_probe, found_target) = crate::vendor::auto_determine_target(probe)?;
+            probe = returned_probe;
 
             // Now we can deassert reset in case we asserted it before. This is always okay.
             probe.target_reset_deassert()?;
 
-            if let Some(chip) = found_chip {
-                crate::config::get_target_by_chip_info(chip)?
+            if let Some(target) = found_target {
+                target
             } else {
                 return Err(Error::ChipNotFound(RegistryError::ChipAutodetectFailed));
             }

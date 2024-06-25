@@ -12,6 +12,7 @@
 //!
 
 mod chip;
+pub mod chip_detection;
 mod chip_family;
 mod flash_algorithm;
 mod flash_properties;
@@ -28,6 +29,6 @@ pub use chip_family::{
 pub use flash_algorithm::{RawFlashAlgorithm, TransferEncoding};
 pub use flash_properties::FlashProperties;
 pub use memory::{
-    GenericRegion, MemoryRange, MemoryRegion, NvmRegion, PageInfo, RamRegion, SectorDescription,
-    SectorInfo,
+    GenericRegion, MemoryAccess, MemoryRange, MemoryRegion, NvmRegion, PageInfo, RamRegion,
+    SectorDescription, SectorInfo,
 };

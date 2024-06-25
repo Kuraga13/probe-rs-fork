@@ -1,5 +1,6 @@
 use super::{
     configuration::{self, ConsoleLog},
+    logger::DebugLogger,
     session_data::SessionData,
     startup::{get_file_timestamp, TargetSessionType},
 };
@@ -29,7 +30,7 @@ use probe_rs::{
 };
 use std::{
     cell::RefCell,
-    fs,
+    fs::{self},
     path::Path,
     rc::Rc,
     thread,
@@ -64,18 +65,32 @@ pub struct Debugger {
     timestamp_offset: UtcOffset,
 
     // TODO: Store somewhere else
-    // Timestamp of the flashed binary
+    /// Timestamp of the flashed binary
     binary_timestamp: Option<Duration>,
+
+    /// Used to capture the `tracing` messages that are generated during the DAP sessions,
+    /// to be ultimately forwarded to the DAP client's Debug Console, or failing that, stderr.
+    pub(crate) debug_logger: DebugLogger,
 }
 
 impl Debugger {
     /// Create a new debugger instance
-    pub fn new(timestamp_offset: UtcOffset) -> Self {
-        Self {
+    pub fn new(
+        timestamp_offset: UtcOffset,
+        log_file: Option<&Path>,
+    ) -> Result<Self, DebuggerError> {
+        let mut debugger = Self {
             config: configuration::SessionConfig::default(),
             timestamp_offset,
             binary_timestamp: None,
-        }
+            debug_logger: DebugLogger::new(log_file)?,
+        };
+
+        debugger
+            .debug_logger
+            .log_to_console("Starting probe-rs as a DAP Protocol server")?;
+
+        Ok(debugger)
     }
 
     /// The logic of this function is as follows:
@@ -90,9 +105,10 @@ impl Debugger {
         session_data: &mut SessionData,
         debug_adapter: &mut DebugAdapter<P>,
     ) -> Result<DebugSessionStatus, DebuggerError> {
+        self.debug_logger.flush_to_dap(debug_adapter)?;
         match debug_adapter.listen_for_request()? {
             None => {
-                let _poll_span = tracing::debug_span!("Polling for core status").entered();
+                let _poll_span = tracing::trace_span!("Polling for core status").entered();
                 if debug_adapter.all_cores_halted {
                     // Once all cores are halted, then we can skip polling the core for status, and just wait for the next DAP Client request.
                     tracing::trace!(
@@ -306,12 +322,8 @@ impl Debugger {
     pub(crate) fn debug_session<P: ProtocolAdapter + 'static>(
         &mut self,
         mut debug_adapter: DebugAdapter<P>,
-        log_info_message: &str,
         lister: &Lister,
     ) -> Result<(), DebuggerError> {
-        debug_adapter.log_to_console("Starting debug session...");
-        debug_adapter.log_to_console(log_info_message);
-
         // The DapClient startup process has a specific sequence.
         // Handle it here before starting a probe-rs session and looping through user generated requests.
         // Handling the initialize, and Attach/Launch requests here in this method,
@@ -321,10 +333,13 @@ impl Debugger {
         if self.handle_initialize(&mut debug_adapter).is_err() {
             // The request handler has already reported this error to the user.
             return Ok(());
+        } else {
+            self.debug_logger.flush_to_dap(&mut debug_adapter)?;
         }
 
         let launch_attach_request = loop {
             if let Some(request) = debug_adapter.listen_for_request()? {
+                self.debug_logger.flush_to_dap(&mut debug_adapter)?;
                 break request;
             }
         };
@@ -334,10 +349,13 @@ impl Debugger {
             match self.handle_launch_attach(&launch_attach_request, debug_adapter, lister) {
                 Ok((debug_adapter, session_data)) => (debug_adapter, session_data),
                 Err(_) => {
-                    // The request handler has already reported this error to the user.
+                    // Because the `handle_launch_attach request handler consumes the `debug_adapter`,
+                    // we have to ensure that it reports all its own errors to the user.
+                    // By the time we get here, we assume that has happened, and exit the debug session gracefully.
                     return Ok(());
                 }
             };
+        self.debug_logger.flush_to_dap(&mut debug_adapter)?;
 
         if debug_adapter
             .send_event::<Event>("initialized", None)
@@ -378,6 +396,7 @@ impl Debugger {
                     debug_adapter = self.restart(debug_adapter, &mut session_data, &request)?;
                 }
                 DebugSessionStatus::Terminate => {
+                    session_data.clean_up(&self.config)?;
                     return Ok(());
                 }
             };
@@ -385,6 +404,7 @@ impl Debugger {
     }
 
     /// Process launch or attach request
+    // Note: This function consumes the 'debug_adapter', so all error reporting via that handle must be done before returning from this function.
     #[tracing::instrument(skip_all, name = "Handle Launch/Attach Request")]
     fn handle_launch_attach<P: ProtocolAdapter + 'static>(
         &mut self,
@@ -396,42 +416,36 @@ impl Debugger {
             "attach" => TargetSessionType::AttachRequest,
             "launch" => TargetSessionType::LaunchRequest,
             other => {
-                let error_msg =
-                    format!("Expected request 'launch' or 'attach', but received '{other}'");
-
-                debug_adapter.send_response::<()>(
-                    launch_attach_request,
-                    Err(&DebuggerError::Other(anyhow!(error_msg.clone()))),
-                )?;
-                return Err(DebuggerError::Other(anyhow!(error_msg)));
+                let error = DebuggerError::Other(anyhow!(
+                    "Expected request 'launch' or 'attach', but received '{other}'"
+                ));
+                debug_adapter.send_response::<()>(launch_attach_request, Err(&error))?;
+                return Err(error);
             }
         };
 
-        self.config = get_arguments(&mut debug_adapter, launch_attach_request)?;
-
-        if requested_target_session_type == TargetSessionType::AttachRequest {
-            // Since VSCode doesn't do field validation checks for relationships in launch.json request types, check it here.
-            if self.config.flashing_config.flashing_enabled
-                || self.config.flashing_config.halt_after_reset
-                || self.config.flashing_config.full_chip_erase
-                || self.config.flashing_config.restore_unwritten_bytes
-            {
-                let error = DebuggerError::Other(anyhow!(
-                                            "Please do not use any of the `flashing_enabled`, `reset_after_flashing`, halt_after_reset`, `full_chip_erase`, or `restore_unwritten_bytes` options when using `attach` request type."));
-
+        self.config = match get_arguments(&mut debug_adapter, launch_attach_request) {
+            Ok(config) => config,
+            Err(error) => {
                 debug_adapter.send_response::<()>(launch_attach_request, Err(&error))?;
-
                 return Err(error);
             }
+        };
+
+        if let Err(bad_config) = self
+            .config
+            .validate_configuration_option_compatibility(requested_target_session_type)
+        {
+            debug_adapter.send_response::<()>(launch_attach_request, Err(&bad_config))?;
+            return Err(bad_config);
         }
 
         debug_adapter
             .set_console_log_level(self.config.console_log_level.unwrap_or(ConsoleLog::Console));
 
-        if let Err(e) = self.config.validate_config_files() {
-            debug_adapter.send_response::<()>(launch_attach_request, Err(&e))?;
-
-            return Err(e);
+        if let Err(error) = self.config.validate_config_files() {
+            debug_adapter.send_response::<()>(launch_attach_request, Err(&error))?;
+            return Err(error);
         }
 
         let mut session_data =
@@ -439,7 +453,6 @@ impl Debugger {
                 Ok(session_data) => session_data,
                 Err(error) => {
                     debug_adapter.send_response::<()>(launch_attach_request, Err(&error))?;
-
                     return Err(error);
                 }
             };
@@ -447,16 +460,21 @@ impl Debugger {
         debug_adapter.halt_after_reset = self.config.flashing_config.halt_after_reset;
 
         if self.config.flashing_config.flashing_enabled {
-            let target_core_config = self.config.core_configs.first_mut().ok_or_else(|| {
-                DebuggerError::Other(anyhow!(
-                    "Cannot continue unless one target core configuration is defined."
-                ))
-            })?;
+            let target_core_config = match self.config.core_configs.first_mut() {
+                Some(config) => config,
+                None => {
+                    let error = DebuggerError::Other(anyhow!(
+                        "Cannot continue unless one target core configuration is defined."
+                    ));
+                    debug_adapter.send_response::<()>(launch_attach_request, Err(&error))?;
+                    return Err(error);
+                }
+            };
 
             let Some(path_to_elf) = target_core_config.program_binary.clone() else {
-                let err =  DebuggerError::Other(anyhow!("Please specify use the `program-binary` option in `launch.json` to specify an executable"));
-                debug_adapter.send_response::<()>(launch_attach_request, Err(&err))?;
-                return Err(err);
+                let error =  DebuggerError::Other(anyhow!("Please specify use the `program-binary` option in `launch.json` to specify an executable"));
+                debug_adapter.send_response::<()>(launch_attach_request, Err(&error))?;
+                return Err(error);
             };
 
             // Store timestamp of flashed binary
@@ -465,29 +483,35 @@ impl Debugger {
             debug_adapter = self.flash(
                 &path_to_elf,
                 debug_adapter,
-                launch_attach_request.seq,
+                launch_attach_request,
                 &mut session_data,
             )?;
         }
 
-        let target_core_config = self.config.core_configs.first_mut().ok_or_else(|| {
-            DebuggerError::Other(anyhow!(
-                "Cannot continue unless one target core configuration is defined."
-            ))
-        })?;
+        let target_core_config = match self.config.core_configs.first_mut() {
+            Some(config) => config,
+            None => {
+                let error = DebuggerError::Other(anyhow!(
+                    "Cannot continue unless one target core configuration is defined."
+                ));
+                debug_adapter.send_response::<()>(launch_attach_request, Err(&error))?;
+                return Err(error);
+            }
+        };
 
         // First, attach to the core
-        let mut target_core = session_data
-            .attach_core(target_core_config.core_index)
-            .or_else(|error| {
-                debug_adapter.show_error_message(&error)?;
-                Err(error)
-            })?;
+        let mut target_core = match session_data.attach_core(target_core_config.core_index) {
+            Ok(session_data) => session_data,
+            Err(error) => {
+                debug_adapter.send_response::<()>(launch_attach_request, Err(&error))?;
+                return Err(error);
+            }
+        };
 
         // Immediately after attaching, halt the core, so that we can finish initalization without bumping into user code.
         // Depending on supplied `config`, the core will be restarted at the end of initialization in the `configuration_done` request.
         if let Err(error) = halt_core(&mut target_core.core) {
-            debug_adapter.show_error_message(&error)?;
+            debug_adapter.send_response::<()>(launch_attach_request, Err(&error))?;
             return Err(error);
         }
 
@@ -498,7 +522,8 @@ impl Debugger {
                 match SvdCache::new(svd_file, &mut debug_adapter, launch_attach_request.seq) {
                     Ok(core_peripherals) => Some(core_peripherals),
                     Err(error) => {
-                        tracing::error!("{:?}", error);
+                        // This is not a fatal error. We can continue the debug session without the SVD file.
+                        tracing::warn!("{:?}", error);
                         None
                     }
                 };
@@ -506,13 +531,22 @@ impl Debugger {
 
         if requested_target_session_type == TargetSessionType::LaunchRequest {
             // This will effectively do a `reset` and `halt` of the core, which is what we want until after the `configuration_done` request.
-            debug_adapter
+            if let Err(error) = debug_adapter
                 .restart(&mut target_core, None)
-                .context("Failed to restart core")?;
+                .context("Failed to restart core")
+            {
+                let error = error.into();
+                debug_adapter.send_response::<()>(launch_attach_request, Err(&error))?;
+                return Err(error);
+            }
         } else {
             // Ensure ebreak enters debug mode, this is necessary for soft breakpoints to work on architectures like RISC-V.
             // For LaunchRequest, this is done in the `restart` above.
-            target_core.core.debug_on_sw_breakpoint(true)?;
+            if let Err(error) = target_core.core.debug_on_sw_breakpoint(true) {
+                let error = error.into();
+                debug_adapter.send_response::<()>(launch_attach_request, Err(&error))?;
+                return Err(error);
+            }
         }
 
         drop(target_core);
@@ -550,8 +584,7 @@ impl Debugger {
                     .attach_core(target_core_config.core_index)
                     .map(|mut target_core| target_core.recompute_breakpoints())??;
 
-                debug_adapter =
-                    self.flash(&path_to_elf, debug_adapter, request.seq, session_data)?;
+                debug_adapter = self.flash(&path_to_elf, debug_adapter, request, session_data)?;
             }
         }
 
@@ -585,13 +618,12 @@ impl Debugger {
 
     /// Flash the given binary, and report the progress to the
     /// debug adapter.
-    ///
-    /// The request_id is used to associate the progress with a given debug adapter request.
+    // Note: This function consumes the 'debug_adapter', so all error reporting via that handle must be done before returning from this function.
     fn flash<P: ProtocolAdapter + 'static>(
         &mut self,
         path_to_elf: &Path,
         mut debug_adapter: DebugAdapter<P>,
-        request_id: i64,
+        launch_attach_request: &Request,
         session_data: &mut SessionData,
     ) -> Result<DebugAdapter<P>, DebuggerError> {
         debug_adapter.log_to_console(format!(
@@ -599,7 +631,7 @@ impl Debugger {
             &path_to_elf
         ));
         let progress_id = debug_adapter
-            .start_progress("Flashing device", Some(request_id))
+            .start_progress("Flashing device", Some(launch_attach_request.seq))
             .ok();
 
         let mut download_options = DownloadOptions::default();
@@ -632,18 +664,26 @@ impl Debugger {
                 let mut flash_progress = progress_state.borrow_mut();
                 let mut debug_adapter = rc_debug_adapter_clone.borrow_mut();
                 match event {
-                    ProgressEvent::Initialized { flash_layout } => {
-                        flash_progress.total_page_size =
-                            flash_layout.pages().iter().map(|s| s.size() as usize).sum();
+                    ProgressEvent::Initialized { phases, .. } => {
+                        for phase_layout in phases {
+                            flash_progress.total_page_size += phase_layout
+                                .pages()
+                                .iter()
+                                .map(|s| s.size() as usize)
+                                .sum::<usize>();
 
-                        flash_progress.total_sector_size = flash_layout
-                            .sectors()
-                            .iter()
-                            .map(|s| s.size() as usize)
-                            .sum();
+                            flash_progress.total_sector_size += phase_layout
+                                .sectors()
+                                .iter()
+                                .map(|s| s.size() as usize)
+                                .sum::<usize>();
 
-                        flash_progress.total_fill_size =
-                            flash_layout.fills().iter().map(|s| s.size() as usize).sum();
+                            flash_progress.total_fill_size += phase_layout
+                                .fills()
+                                .iter()
+                                .map(|s| s.size() as usize)
+                                .sum::<usize>();
+                        }
                     }
                     ProgressEvent::StartedFilling => {
                         debug_adapter
@@ -723,12 +763,33 @@ impl Debugger {
 
         download_options.progress = flash_progress;
 
-        let loader = build_loader(
+        let loader = match build_loader(
             &mut session_data.session,
             path_to_elf,
             self.config.flashing_config.format_options.clone(),
             None,
-        )?;
+        ) {
+            Ok(loader) => loader,
+            Err(error) => {
+                // `download-options` need to be dropped, to free the `debug_adapter`,
+                // before we can use it to return the error to the user.
+                drop(download_options);
+                debug_adapter = match Rc::try_unwrap(rc_debug_adapter) {
+                    Ok(debug_adapter) => debug_adapter.into_inner(),
+                    Err(too_many_strong_references) => {
+                        let reference_error = DebuggerError::Other(anyhow!("Unexpected error while dereferencing the `debug_adapter` (It has {} strong references). Please report this as a bug.", Rc::strong_count(&too_many_strong_references)));
+                        tracing::error!("{reference_error:?}");
+                        return Err(reference_error);
+                    }
+                };
+                if let Some(id) = progress_id {
+                    let _ = debug_adapter.end_progress(id);
+                }
+                let error = DebuggerError::Other(error);
+                debug_adapter.send_response::<()>(launch_attach_request, Err(&error))?;
+                return Err(error);
+            }
+        };
 
         let flash_result = loader
             .commit(&mut session_data.session, download_options)
@@ -737,8 +798,9 @@ impl Debugger {
         debug_adapter = match Rc::try_unwrap(rc_debug_adapter) {
             Ok(debug_adapter) => debug_adapter.into_inner(),
             Err(too_many_strong_references) => {
-                let other_error = DebuggerError::Other(anyhow!("Unexpected error while dereferencing the `debug_adapter` (It has {} strong references). Please report this as a bug.", Rc::strong_count(&too_many_strong_references)));
-                return Err(other_error);
+                let reference_error = DebuggerError::Other(anyhow!("Unexpected error while dereferencing the `debug_adapter` (It has {} strong references). Please report this as a bug.", Rc::strong_count(&too_many_strong_references)));
+                tracing::error!("{reference_error:?}");
+                return Err(reference_error);
             }
         };
 
@@ -756,7 +818,7 @@ impl Debugger {
             }
             Err(error) => {
                 let error = DebuggerError::FileDownload(error);
-                debug_adapter.show_error_message(&error)?;
+                debug_adapter.send_response::<()>(launch_attach_request, Err(&error))?;
                 Err(error)
             }
         }
@@ -904,22 +966,6 @@ pub(crate) fn is_file_newer(
 mod test {
     #![allow(clippy::unwrap_used, clippy::panic)]
 
-    use core::panic;
-    use std::collections::{BTreeMap, HashMap, VecDeque};
-    use std::fmt::Display;
-    use std::path::PathBuf;
-
-    use probe_rs::architecture::arm::ApAddress;
-    use probe_rs::probe::{
-        DebugProbe, DebugProbeError, DebugProbeInfo, DebugProbeSelector, ProbeFactory,
-    };
-    use probe_rs::{
-        integration::{FakeProbe, Operation},
-        probe::list::Lister,
-    };
-    use serde_json::json;
-    use time::UtcOffset;
-
     use crate::cmd::dap_server::{
         debug_adapter::{
             dap::{
@@ -935,6 +981,22 @@ mod test {
         server::configuration::{ConsoleLog, CoreConfig, FlashingConfig, SessionConfig},
         test::TestLister,
     };
+    use core::panic;
+    use probe_rs::{
+        architecture::arm::ApAddress,
+        integration::{FakeProbe, Operation},
+        probe::{
+            list::Lister, DebugProbe, DebugProbeError, DebugProbeInfo, DebugProbeSelector,
+            ProbeFactory,
+        },
+    };
+    use serde_json::json;
+    use std::{
+        collections::{BTreeMap, HashMap, VecDeque},
+        fmt::Display,
+        path::PathBuf,
+    };
+    use time::UtcOffset;
 
     #[derive(Debug)]
     struct MockProbeFactory;
@@ -999,6 +1061,12 @@ mod test {
             supports_start_debugging_request: None,
             supports_variable_paging: None,
             supports_variable_type: None,
+        }
+    }
+
+    fn error_response_body(msg: &str) -> ErrorResponseBody {
+        ErrorResponseBody {
+            error: Some(error_message(msg)),
         }
     }
 
@@ -1241,19 +1309,18 @@ mod test {
             .and_succesful_response()
             .with_body(expected_capabilites());
 
-        protocol_adapter.expect_output_event("Starting debug session...\n");
-        protocol_adapter.expect_output_event("Some message?\n");
+        protocol_adapter.expect_output_event("probe-rs-debug: Log output for \"probe_rs=warn\" will be written to the Debug Console.\n");
+        protocol_adapter
+            .expect_output_event("probe-rs-debug: Starting probe-rs as a DAP Protocol server\n");
 
         let debug_adapter = DebugAdapter::new(protocol_adapter);
 
-        let mut debugger = Debugger::new(UtcOffset::UTC);
+        let mut debugger = Debugger::new(UtcOffset::UTC, None).unwrap();
 
         let lister = Lister::with_lister(Box::new(TestLister::new()));
 
         // TODO: Check proper return value
-        debugger
-            .debug_session(debug_adapter, "Some message?", &lister)
-            .unwrap_err();
+        debugger.debug_session(debug_adapter, &lister).unwrap_err();
     }
 
     #[test]
@@ -1266,43 +1333,30 @@ mod test {
             .and_succesful_response()
             .with_body(expected_capabilites());
 
-        protocol_adapter.expect_output_event("Starting debug session...\n");
-        protocol_adapter.expect_output_event("initial info message\n");
+        protocol_adapter.expect_output_event("probe-rs-debug: Log output for \"probe_rs=warn\" will be written to the Debug Console.\n");
+        protocol_adapter
+            .expect_output_event("probe-rs-debug: Starting probe-rs as a DAP Protocol server\n");
 
         let launch_args = SessionConfig::default();
 
         let args = serde_json::to_value(launch_args).unwrap();
 
+        let expected_error = "No connected probes were found.";
+        protocol_adapter.expect_output_event(&format!("{expected_error}\n"));
+
         protocol_adapter
             .add_request("launch")
             .with_arguments(args)
             .and_error_response()
-            .with_body(ErrorResponseBody {
-                error: Some(Message {
-                    format: "{response_message}".to_string(),
-                    id: 0,
-                    send_telemetry: Some(false),
-                    show_user: Some(true),
-                    url: Some("https://probe.rs/docs/tools/debugger/".to_string()),
-                    url_label: Some("Documentation".to_string()),
-                    variables: Some(BTreeMap::from([(
-                        "response_message".to_string(),
-                        "No connected probes were found.".to_string(),
-                    )])),
-                }),
-            });
-
-        protocol_adapter.expect_output_event("No connected probes were found.\n");
+            .with_body(error_response_body(expected_error));
 
         let debug_adapter = DebugAdapter::new(protocol_adapter);
 
-        let mut debugger = Debugger::new(UtcOffset::UTC);
+        let mut debugger = Debugger::new(UtcOffset::UTC, None).unwrap();
 
         let lister = Lister::with_lister(Box::new(TestLister::new()));
 
-        debugger
-            .debug_session(debug_adapter, "initial info message", &lister)
-            .unwrap();
+        debugger.debug_session(debug_adapter, &lister).unwrap();
     }
 
     #[test]
@@ -1320,8 +1374,9 @@ mod test {
             .and_succesful_response()
             .with_body(expected_capabilites());
 
-        protocol_adapter.expect_output_event("Starting debug session...\n");
-        protocol_adapter.expect_output_event("initial info message\n");
+        protocol_adapter.expect_output_event("probe-rs-debug: Log output for \"probe_rs=warn\" will be written to the Debug Console.\n");
+        protocol_adapter
+            .expect_output_event("probe-rs-debug: Starting probe-rs as a DAP Protocol server\n");
 
         let launch_args = SessionConfig {
             chip: Some("nrf52833_xxaa".to_owned()),
@@ -1351,7 +1406,7 @@ mod test {
 
         let debug_adapter = DebugAdapter::new(protocol_adapter);
 
-        let mut debugger = Debugger::new(UtcOffset::UTC);
+        let mut debugger = Debugger::new(UtcOffset::UTC, None).unwrap();
 
         let lister = TestLister::new();
 
@@ -1377,9 +1432,7 @@ mod test {
 
         let lister = Lister::with_lister(Box::new(lister));
 
-        debugger
-            .debug_session(debug_adapter, "initial info message", &lister)
-            .unwrap();
+        debugger.debug_session(debug_adapter, &lister).unwrap();
     }
 
     #[test]
@@ -1392,8 +1445,9 @@ mod test {
             .and_succesful_response()
             .with_body(expected_capabilites());
 
-        protocol_adapter.expect_output_event("Starting debug session...\n");
-        protocol_adapter.expect_output_event("initial info message\n");
+        protocol_adapter.expect_output_event("probe-rs-debug: Log output for \"probe_rs=warn\" will be written to the Debug Console.\n");
+        protocol_adapter
+            .expect_output_event("probe-rs-debug: Starting probe-rs as a DAP Protocol server\n");
 
         let launch_args = SessionConfig {
             chip: Some("nrf52833_xxaa".to_owned()),
@@ -1404,30 +1458,18 @@ mod test {
             ..SessionConfig::default()
         };
 
-        //protocol_adapter.expect_output_event("Please use the `program-binary` option to specify an executable for this target core. Other(Missing value for file.)\n");
+        let expected_error = "Please use the `program-binary` option to specify an executable for this target core. Other(Missing value for file.)";
+        protocol_adapter.expect_output_event(&format!("{expected_error}\n"));
+
         protocol_adapter
             .add_request("launch")
             .with_arguments(launch_args)
-            .and_error_response().with_body(ErrorResponseBody {
-                error: Some(Message {
-                    format: "{response_message}".to_string(),
-                    id: 0,
-                    send_telemetry: Some(false),
-                    show_user: Some(true),
-                    url: Some("https://probe.rs/docs/tools/debugger/".to_string()),
-                    url_label: Some("Documentation".to_string()),
-                    variables: Some(BTreeMap::from([(
-                        "response_message".to_string(),
-                        "Please use the `program-binary` option to specify an executable for this target core. Other(Missing value for file.)".to_string(),
-                    )])),
-                }),
-            });
-
-        protocol_adapter.expect_output_event("Please use the `program-binary` option to specify an executable for this target core. Other(Missing value for file.)\n");
+            .and_error_response()
+            .with_body(error_response_body(expected_error));
 
         let debug_adapter = DebugAdapter::new(protocol_adapter);
 
-        let mut debugger = Debugger::new(UtcOffset::UTC);
+        let mut debugger = Debugger::new(UtcOffset::UTC, None).unwrap();
 
         let lister = TestLister::new();
 
@@ -1453,9 +1495,7 @@ mod test {
 
         let lister = Lister::with_lister(Box::new(lister));
 
-        debugger
-            .debug_session(debug_adapter, "initial info message", &lister)
-            .unwrap();
+        debugger.debug_session(debug_adapter, &lister).unwrap();
     }
 
     #[test]
@@ -1468,22 +1508,20 @@ mod test {
             .and_succesful_response()
             .with_body(expected_capabilites());
 
-        protocol_adapter.expect_output_event("Starting debug session...\n");
-        protocol_adapter.expect_output_event("initial info message\n");
+        protocol_adapter.expect_output_event("probe-rs-debug: Log output for \"probe_rs=warn\" will be written to the Debug Console.\n");
+        protocol_adapter
+            .expect_output_event("probe-rs-debug: Starting probe-rs as a DAP Protocol server\n");
+
+        let expected_error = "Expected request 'launch' or 'attach', but received 'threads'";
+        protocol_adapter.expect_output_event(&format!("{expected_error}\n"));
 
         protocol_adapter
             .add_request("threads")
             .and_error_response()
-            .with_body(ErrorResponseBody {
-                error: Some(error_message(
-                    "Expected request 'launch' or 'attach', but received 'threads'",
-                )),
-            });
-        protocol_adapter
-            .expect_output_event("Expected request 'launch' or 'attach', but received 'threads'\n");
+            .with_body(error_response_body(expected_error));
 
         let debug_adapter = DebugAdapter::new(protocol_adapter);
-        let mut debugger = Debugger::new(UtcOffset::UTC);
+        let mut debugger = Debugger::new(UtcOffset::UTC, None).unwrap();
         let lister = TestLister::new();
         let probe_info = DebugProbeInfo::new(
             "Mock probe",
@@ -1507,9 +1545,7 @@ mod test {
 
         let lister = Lister::with_lister(Box::new(lister));
 
-        debugger
-            .debug_session(debug_adapter, "initial info message", &lister)
-            .unwrap();
+        debugger.debug_session(debug_adapter, &lister).unwrap();
     }
 
     #[test]
@@ -1522,8 +1558,9 @@ mod test {
             .and_succesful_response()
             .with_body(expected_capabilites());
 
-        protocol_adapter.expect_output_event("Starting debug session...\n");
-        protocol_adapter.expect_output_event("initial info message\n");
+        protocol_adapter.expect_output_event("probe-rs-debug: Log output for \"probe_rs=warn\" will be written to the Debug Console.\n");
+        protocol_adapter
+            .expect_output_event("probe-rs-debug: Starting probe-rs as a DAP Protocol server\n");
 
         let manifest_dir = PathBuf::from(std::env!("CARGO_MANIFEST_DIR"));
         let debug_info =
@@ -1556,7 +1593,7 @@ mod test {
             .and_succesful_response();
 
         let debug_adapter = DebugAdapter::new(protocol_adapter);
-        let mut debugger = Debugger::new(UtcOffset::UTC);
+        let mut debugger = Debugger::new(UtcOffset::UTC, None).unwrap();
         let lister = TestLister::new();
         let probe_info = DebugProbeInfo::new(
             "Mock probe",
@@ -1580,9 +1617,7 @@ mod test {
 
         let lister = Lister::with_lister(Box::new(lister));
 
-        debugger
-            .debug_session(debug_adapter, "initial info message", &lister)
-            .unwrap();
+        debugger.debug_session(debug_adapter, &lister).unwrap();
     }
 
     #[test]
@@ -1595,8 +1630,9 @@ mod test {
             .and_succesful_response()
             .with_body(expected_capabilites());
 
-        protocol_adapter.expect_output_event("Starting debug session...\n");
-        protocol_adapter.expect_output_event("initial info message\n");
+        protocol_adapter.expect_output_event("probe-rs-debug: Log output for \"probe_rs=warn\" will be written to the Debug Console.\n");
+        protocol_adapter
+            .expect_output_event("probe-rs-debug: Starting probe-rs as a DAP Protocol server\n");
 
         let manifest_dir = PathBuf::from(std::env!("CARGO_MANIFEST_DIR"));
         let debug_info =
@@ -1617,19 +1653,17 @@ mod test {
             ..SessionConfig::default()
         };
 
+        let expected_error = "Please do not use any of the `flashing_enabled`, `reset_after_flashing`, halt_after_reset`, `full_chip_erase`, or `restore_unwritten_bytes` options when using `attach` request type.";
+        protocol_adapter.expect_output_event(&format!("{expected_error}\n"));
+
         protocol_adapter
             .add_request("attach")
             .with_arguments(attach_args)
-            .and_error_response().with_body(ErrorResponseBody {
-                error: Some(error_message(
-                    "Please do not use any of the `flashing_enabled`, `reset_after_flashing`, halt_after_reset`, `full_chip_erase`, or `restore_unwritten_bytes` options when using `attach` request type.",
-                )),
-            });
-
-        protocol_adapter.expect_output_event("Please do not use any of the `flashing_enabled`, `reset_after_flashing`, halt_after_reset`, `full_chip_erase`, or `restore_unwritten_bytes` options when using `attach` request type.\n");
+            .and_error_response()
+            .with_body(error_response_body(expected_error));
 
         let debug_adapter = DebugAdapter::new(protocol_adapter);
-        let mut debugger = Debugger::new(UtcOffset::UTC);
+        let mut debugger = Debugger::new(UtcOffset::UTC, None).unwrap();
         let lister = TestLister::new();
         let probe_info = DebugProbeInfo::new(
             "Mock probe",
@@ -1653,9 +1687,7 @@ mod test {
 
         let lister = Lister::with_lister(Box::new(lister));
 
-        debugger
-            .debug_session(debug_adapter, "initial info message", &lister)
-            .unwrap();
+        debugger.debug_session(debug_adapter, &lister).unwrap();
     }
 
     #[test]
@@ -1673,8 +1705,9 @@ mod test {
             .and_succesful_response()
             .with_body(expected_capabilites());
 
-        protocol_adapter.expect_output_event("Starting debug session...\n");
-        protocol_adapter.expect_output_event("initial info message\n");
+        protocol_adapter.expect_output_event("probe-rs-debug: Log output for \"probe_rs=warn\" will be written to the Debug Console.\n");
+        protocol_adapter
+            .expect_output_event("probe-rs-debug: Starting probe-rs as a DAP Protocol server\n");
 
         let launch_args = SessionConfig {
             chip: Some(chip_name.to_owned()),
@@ -1718,7 +1751,7 @@ mod test {
 
         let debug_adapter = DebugAdapter::new(protocol_adapter);
 
-        let mut debugger = Debugger::new(UtcOffset::UTC);
+        let mut debugger = Debugger::new(UtcOffset::UTC, None).unwrap();
 
         let lister = TestLister::new();
 
@@ -1744,8 +1777,6 @@ mod test {
 
         let lister = Lister::with_lister(Box::new(lister));
 
-        debugger
-            .debug_session(debug_adapter, "initial info message", &lister)
-            .unwrap();
+        debugger.debug_session(debug_adapter, &lister).unwrap();
     }
 }

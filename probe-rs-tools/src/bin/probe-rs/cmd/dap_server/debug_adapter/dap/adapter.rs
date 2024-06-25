@@ -20,7 +20,6 @@ use crate::util::rtt;
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose as base64_engine, Engine as _};
 use dap_types::*;
-use num_traits::Zero;
 use parse_int::parse;
 use probe_rs::{
     architecture::{
@@ -202,14 +201,14 @@ impl<P: ProtocolAdapter> DebugAdapter<P> {
         }
         // Currently, VSCode sends a request with count=0 after the last successful one ... so
         // let's ignore it.
-        if !result_buffer.is_empty() || (self.vscode_quirks && arguments.count.is_zero()) {
+        if !result_buffer.is_empty() || (self.vscode_quirks && arguments.count == 0) {
             let response = base64_engine::STANDARD.encode(&result_buffer);
             self.send_response(
                 request,
                 Ok(Some(ReadMemoryResponseBody {
                     address: format!("{address:#010x}"),
                     data: Some(response),
-                    unreadable_bytes: if num_bytes_unread.is_zero() {
+                    unreadable_bytes: if num_bytes_unread == 0 {
                         None
                     } else {
                         Some(num_bytes_unread as i64)
@@ -401,7 +400,7 @@ impl<P: ProtocolAdapter> DebugAdapter<P> {
                             }
                             Err(error) => match &error {
                                 DebuggerError::UserMessage(repl_message) => {
-                                    response_body.result = repl_message.to_owned()
+                                    repl_message.clone_into(&mut response_body.result)
                                 }
                                 other_error => response_body.result = format!("{other_error:?}",),
                             },
@@ -486,7 +485,7 @@ impl<P: ProtocolAdapter> DebugAdapter<P> {
                             response_body.memory_reference =
                                 Some(variable.memory_location.to_string());
                             response_body.named_variables = Some(named_child_variables_cnt);
-                            response_body.result = variable.get_value(variable_cache);
+                            response_body.result = variable.to_string(variable_cache);
                             response_body.type_ = Some(variable.type_name());
                             response_body.variables_reference = variables_reference.into();
                         } else {
@@ -628,7 +627,7 @@ impl<P: ProtocolAdapter> DebugAdapter<P> {
                             response_body.named_variables = Some(named_child_variables_cnt);
                             response_body.indexed_variables = Some(indexed_child_variables_cnt);
                             response_body.type_ = Some(format!("{:?}", cache_variable.type_name));
-                            response_body.value = new_value.clone();
+                            response_body.value.clone_from(new_value);
                         }
                         Err(error) => {
                             return self.send_response::<SetVariableResponseBody>(
@@ -1523,7 +1522,7 @@ impl<P: ProtocolAdapter> DebugAdapter<P> {
                         named_variables: Some(named_child_variables_cnt),
                         presentation_hint: None,
                         type_: Some(variable.type_name()),
-                        value: variable.get_value(variable_cache),
+                        value: variable.to_string(variable_cache),
                         variables_reference: variables_reference.into(),
                     }
                 })
@@ -1751,6 +1750,7 @@ impl<P: ProtocolAdapter> DebugAdapter<P> {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip_all)]
     pub fn send_event<S: Serialize>(
         &mut self,
         event_type: &str,

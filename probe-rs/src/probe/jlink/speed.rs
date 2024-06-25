@@ -3,8 +3,6 @@ use super::error::JlinkError;
 
 use super::Command;
 
-use byteorder::{LittleEndian, ReadBytesExt};
-
 use std::{cmp, fmt};
 
 use super::JLink;
@@ -82,13 +80,14 @@ impl JLink {
 
         self.write_cmd(&[Command::GetSpeeds as u8])?;
 
-        let mut buf = [0; 6];
-        self.read(&mut buf)?;
-        let mut buf = &buf[..];
+        let buf = self.read_n::<6>()?;
+
+        let base_freq_bytes = <[u8; 4]>::try_from(&buf[0..4]).unwrap();
+        let min_div_bytes = <[u8; 2]>::try_from(&buf[4..6]).unwrap();
 
         Ok(SpeedInfo {
-            base_freq: buf.read_u32::<LittleEndian>().unwrap(),
-            min_div: buf.read_u16::<LittleEndian>().unwrap(),
+            base_freq: u32::from_le_bytes(base_freq_bytes),
+            min_div: u16::from_le_bytes(min_div_bytes),
         })
     }
 
